@@ -1,0 +1,231 @@
+version: '3.8'
+
+services:
+  # TiDB Database Service - DISABLED (Using TiDB Cloud instead)
+  # tidb:
+  #   image: pingcap/tidb:v7.5.2
+  #   container_name: tidb-server
+  #   ports:
+  #     - "4000:4000"  # TiDB MySQL protocol port
+  #     - "10080:10080"  # TiDB status port
+  #   command: >
+  #     /tidb-server
+  #     --store=mocktikv
+  #     --host=0.0.0.0
+  #     --advertise-address=tidb
+  #     --path=/tmp/tidb
+  #     --log-file=
+  #   environment:
+  #     - GOLOG_v=0
+  #   volumes:
+  #     - tidb_data:/tmp/tidb
+  #     - ./init-scripts:/docker-entrypoint-initdb.d
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:10080/status"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 5
+  #     start_period: 30s
+  #   networks:
+  #     - tidb-network
+  #   restart: unless-stopped
+
+  # Zookeeper Service (required for Kafka)
+  zookeeper:   #kafka coordination
+    image: confluentinc/cp-zookeeper:7.4.4
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_SYNC_LIMIT: 2
+    volumes:
+      - zk_data:/var/lib/zookeeper/data
+      - zk_logs:/var/lib/zookeeper/log
+    networks:
+      - tidb-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo 'ruok' | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Apache Kafka Message Broker
+  kafka: #main message broker
+    image: confluentinc/cp-kafka:7.4.4
+    container_name: kafka-broker
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - tidb-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # Backend API Service
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: tidb-backend
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=docker
+      - DB_HOST=gateway01.us-west-2.prod.aws.tidbcloud.com
+      - DB_PORT=4000
+      - DB_USER=3jwcaJ2ej5s6Zq5.root
+      - DB_PASSWORD=pXq5oDTve1LHueG6
+      - DB_NAME=test
+      - DB_SSL=true
+      - KAFKA_BROKERS=kafka:29092
+      - JWT_SECRET=tidb-sre-assignment-secret-key-2024
+      - PORT=3001
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+      - backend_logs:/app/logs
+    networks:
+      - tidb-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # TiDB Change Data Capture Service
+  tidb-cdc:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: tidb-cdc-service
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      - NODE_ENV=docker
+      - DB_HOST=gateway01.us-west-2.prod.aws.tidbcloud.com
+      - DB_PORT=4000
+      - DB_USER=3jwcaJ2ej5s6Zq5.root
+      - DB_PASSWORD=pXq5oDTve1LHueG6
+      - DB_NAME=test
+      - DB_SSL=true
+      - KAFKA_BROKERS=kafka:29092
+    command: ["node", "tidb-cdc.js"]
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+      - cdc_logs:/app/logs
+    networks:
+      - tidb-network
+    restart: unless-stopped
+
+  # Kafka Consumer for Real-time Processing
+  kafka-consumer:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: kafka-consumer-service
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      - NODE_ENV=docker
+      - KAFKA_BROKERS=kafka:29092
+    command: ["node", "kafka-consumer.js"]
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+      - consumer_logs:/app/logs
+    networks:
+      - tidb-network
+    restart: unless-stopped
+
+  # Frontend React Service
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: tidb-frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "3000:80"
+    environment:
+      - REACT_APP_API_URL=http://localhost:3001
+    networks:
+      - tidb-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # Kafka UI for monitoring (optional)
+  kafka-ui: #kafka for monitoring interface
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks:
+      - tidb-network
+    restart: unless-stopped
+
+# Networks
+networks:
+  tidb-network:
+    driver: bridge
+    name: tidb-assignment-network
+
+# Volumes for data persistence
+volumes:
+  tidb_data:
+    name: tidb_data
+  kafka_data:
+    name: kafka_data
+  zk_data:
+    name: zookeeper_data
+  zk_logs:
+    name: zookeeper_logs
+  backend_logs:
+    name: backend_logs
+  cdc_logs:
+    name: cdc_logs
+  consumer_logs:
+    name: consumer_logs
